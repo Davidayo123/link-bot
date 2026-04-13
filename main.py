@@ -1,18 +1,17 @@
 """
 Link Bot — Cloud-hosted bot with a mobile-friendly dashboard.
 
-Uses headless Chrome (Selenium) to realistically browse pages:
-  • Loads the full page (JS, CSS, images)
-  • Scrolls down gradually for ~10 seconds like a real user
-  • Randomises device type, viewport, and User-Agent per visit
-  • Routes each visit through a different free proxy for IP diversity
+Visits a URL realistically every N minutes:
+  PRIMARY  → headless Chrome (loads page, scrolls ~10s like a real user)
+  FALLBACK → HTTP request (if Chrome unavailable on the host)
 
-Control it from your phone via the web dashboard.
-Protected by a PIN code.
+Both modes rotate free proxies + random device profiles for IP diversity.
 
-Environment Variables (set these on Render):
+Control it from your phone via the web dashboard — PIN-protected.
+
+Environment Variables (set on Render):
     BOT_PIN             — Dashboard PIN (default: 1234)
-    SECRET_KEY          — Flask session secret (change in production)
+    SECRET_KEY          — Flask session secret
     RENDER_EXTERNAL_URL — Auto-set by Render, used for self-ping
 """
 
@@ -36,8 +35,6 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "bot-secret-change-in-production-xyz")
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-
-# Sessions expire after 30 minutes → user must re-enter PIN
 app.permanent_session_lifetime = timedelta(minutes=30)
 
 # ─── Configuration ───────────────────────────────────────────────
@@ -49,68 +46,65 @@ DEFAULT_URL = (
 )
 DEFAULT_INTERVAL = 5  # minutes
 
+# ─── Project root (for finding downloaded Chrome) ────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 # ─── Auto-detect Chrome + ChromeDriver ──────────────────────────
 
 def _find_chrome_binary():
-    """Search PATH and common locations for a Chrome/Chromium binary."""
-    # 1) Check $PATH
-    for name in ("chromium", "chromium-browser",
-                 "google-chrome", "google-chrome-stable"):
+    """Search PATH, project dir, and common locations for Chrome."""
+    # PATH lookup
+    for name in ("google-chrome", "google-chrome-stable",
+                 "chromium", "chromium-browser"):
         p = shutil.which(name)
         if p:
             return p
-    # 2) Common absolute paths
-    for p in (
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/lib/chromium/chromium",
-    ):
+    # Chrome for Testing (downloaded by build.sh)
+    cft = os.path.join(BASE_DIR, "chrome-linux64", "chrome")
+    if os.path.isfile(cft):
+        return cft
+    # Common absolute paths
+    for p in ("/usr/bin/google-chrome", "/usr/bin/chromium",
+              "/usr/bin/chromium-browser"):
         if os.path.isfile(p):
             return p
     return None
 
 
 def _find_chromedriver():
-    """Search PATH and common locations for the ChromeDriver binary."""
+    """Search PATH, project dir, and common locations for ChromeDriver."""
     p = shutil.which("chromedriver")
     if p:
         return p
-    for p in (
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ):
+    cft = os.path.join(BASE_DIR, "chromedriver-linux64", "chromedriver")
+    if os.path.isfile(cft):
+        return cft
+    for p in ("/usr/bin/chromedriver", "/usr/lib/chromium/chromedriver"):
         if os.path.isfile(p):
             return p
     return None
 
 
-# Resolve once at import time and log the results
 CHROME_BINARY = _find_chrome_binary()
 CHROMEDRIVER_PATH = _find_chromedriver()
-print(f"  [Boot] Chrome binary  : {CHROME_BINARY or 'NOT FOUND'}")
-print(f"  [Boot] ChromeDriver   : {CHROMEDRIVER_PATH or 'NOT FOUND (will try webdriver-manager)'}")
+print(f"  [Boot] Chrome binary : {CHROME_BINARY or 'NOT FOUND → HTTP mode'}")
+print(f"  [Boot] ChromeDriver  : {CHROMEDRIVER_PATH or 'NOT FOUND'}")
 
 
 def _get_chromedriver_service():
-    """Return a Selenium Service pointing to ChromeDriver."""
+    """Return a Service for ChromeDriver."""
     if CHROMEDRIVER_PATH:
         return Service(CHROMEDRIVER_PATH)
-    # Fallback — let webdriver-manager download a matching driver
+    # Last resort: webdriver-manager
     try:
         from webdriver_manager.chrome import ChromeDriverManager
         return Service(ChromeDriverManager().install())
     except Exception as exc:
-        raise RuntimeError(
-            f"Cannot locate ChromeDriver. System path not found and "
-            f"webdriver-manager also failed: {exc}"
-        )
+        raise RuntimeError(f"No ChromeDriver found: {exc}")
 
 
-# ─── Device Profiles (User-Agent + Viewport + Label) ─────────────
+# ─── Device Profiles ────────────────────────────────────────────
 DEVICE_PROFILES = [
     {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -168,9 +162,7 @@ PROXY_SOURCES = [
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class ProxyManager:
-    """Fetches and rotates free HTTP/HTTPS proxies."""
-
-    REFRESH_INTERVAL = 30 * 60  # 30 minutes
+    REFRESH_INTERVAL = 30 * 60
 
     def __init__(self):
         self.proxies: list[str] = []
@@ -186,23 +178,21 @@ class ProxyManager:
             self._log_fn(level, msg)
 
     def refresh(self):
-        new_proxies: list[str] = []
-        for source in PROXY_SOURCES:
+        found: list[str] = []
+        for src in PROXY_SOURCES:
             try:
-                resp = http_requests.get(source, timeout=10)
-                if resp.status_code == 200:
-                    for line in resp.text.strip().splitlines():
+                r = http_requests.get(src, timeout=10)
+                if r.status_code == 200:
+                    for line in r.text.strip().splitlines():
                         p = line.strip()
                         if p and ":" in p:
-                            new_proxies.append(p)
+                            found.append(p)
             except Exception:
                 continue
-
         with self._lock:
-            self.proxies = list(set(new_proxies))
+            self.proxies = list(set(found))
             random.shuffle(self.proxies)
             self.last_refresh = datetime.now()
-
         self._log("info", f"Proxy pool refreshed — {len(self.proxies)} proxies")
 
     def get_proxy(self) -> str | None:
@@ -232,7 +222,7 @@ class ProxyManager:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class BotEngine:
-    """Background worker that visits a URL with a real headless browser."""
+    """Background worker — visits a URL every N minutes."""
 
     def __init__(self):
         self.url = DEFAULT_URL
@@ -251,6 +241,9 @@ class BotEngine:
         self._lock = threading.Lock()
         self.proxy_manager = ProxyManager()
         self.proxy_manager.set_logger(self._log)
+        # Chrome might be found at boot but fail at runtime (missing libs)
+        # → first visit tries Chrome; if it crashes we flip this flag off.
+        self._chrome_ok: bool = bool(CHROME_BINARY)
 
     # ── Logging ──────────────────────────────────────────────────
     def _log(self, level, msg):
@@ -267,7 +260,6 @@ class BotEngine:
     # ── Chrome Driver Factory ────────────────────────────────────
     @staticmethod
     def _create_driver(profile: dict, proxy: str | None = None):
-        """Launch a headless Chrome with the given fingerprint."""
         opts = Options()
         opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
@@ -277,122 +269,152 @@ class BotEngine:
         opts.add_argument("--disable-infobars")
         opts.add_argument("--disable-notifications")
         opts.add_argument("--disable-popup-blocking")
-
-        # Memory optimizations (Render free-tier = 512 MB)
+        # Memory optimizations
         opts.add_argument("--single-process")
         opts.add_argument("--disable-background-timer-throttling")
         opts.add_argument("--disable-renderer-backgrounding")
         opts.add_argument("--disable-backgrounding-occluded-windows")
         opts.add_argument("--js-flags=--max-old-space-size=128")
-
-        # Random fingerprint
+        # Fingerprint
         opts.add_argument(f"--user-agent={profile['ua']}")
         w, h = profile["vp"]
         opts.add_argument(f"--window-size={w},{h}")
-
-        # Proxy
         if proxy:
             opts.add_argument(f"--proxy-server=http://{proxy}")
-
-        # Chrome binary (auto-detected at boot)
         if CHROME_BINARY:
             opts.binary_location = CHROME_BINARY
-
-        # ChromeDriver (system → webdriver-manager fallback)
         svc = _get_chromedriver_service()
         driver = webdriver.Chrome(service=svc, options=opts)
         driver.set_page_load_timeout(30)
         return driver
 
-    # ── Realistic Scroll Behaviour ───────────────────────────────
+    # ── Scroll ───────────────────────────────────────────────────
     @staticmethod
-    def _scroll_page(driver, duration_target: float = 10.0):
-        """Scroll down the page gradually over ~duration_target seconds."""
+    def _scroll_page(driver, secs: float = 10.0):
         try:
             total_h = driver.execute_script(
-                "return Math.max("
-                "  document.body.scrollHeight,"
-                "  document.documentElement.scrollHeight"
-                ")"
+                "return Math.max(document.body.scrollHeight,"
+                "document.documentElement.scrollHeight)"
             )
         except Exception:
             total_h = 4000
-
         steps = random.randint(5, 8)
-        per_step = duration_target / steps
-
+        per = secs / steps
         for i in range(1, steps + 1):
-            target_y = int(total_h * i / steps)
+            y = int(total_h * i / steps)
             driver.execute_script(
-                f"window.scrollTo({{top:{target_y},behavior:'smooth'}})"
+                f"window.scrollTo({{top:{y},behavior:'smooth'}})"
             )
-            time.sleep(per_step + random.uniform(-0.3, 0.5))
-
-        # Pause at bottom (like reading)
+            time.sleep(per + random.uniform(-0.3, 0.5))
         time.sleep(random.uniform(1.0, 3.0))
 
-    # ── Single Visit ─────────────────────────────────────────────
+    # ── HTTP Visit (fallback) ────────────────────────────────────
+    def _http_visit(self, user_agent: str, proxy: str | None):
+        """Load the page via HTTP and simulate dwell time."""
+        headers = {
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;"
+                      "q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
+        proxies = (
+            {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+            if proxy else None
+        )
+        http_requests.get(
+            self.url, headers=headers, timeout=30,
+            allow_redirects=True, proxies=proxies,
+        )
+        # Simulate reading/scrolling time (~10 s)
+        time.sleep(random.uniform(8.0, 12.0))
+
+    # ── Visit Orchestrator ───────────────────────────────────────
     def _visit(self):
         profile = random.choice(DEVICE_PROFILES)
         device = profile["device"]
 
-        # Refresh proxy pool when stale
         if self.proxy_manager.needs_refresh():
             try:
                 self.proxy_manager.refresh()
             except Exception:
-                self._log("info", "Proxy refresh failed — will use direct")
+                self._log("info", "Proxy refresh failed")
 
-        # Try up to 3 proxies, then fall back to direct connection
-        MAX_PROXY_TRIES = 3
-        for attempt in range(MAX_PROXY_TRIES + 1):
+        MAX_PROXY = 3
+        for attempt in range(MAX_PROXY + 1):
             proxy = (
                 self.proxy_manager.get_proxy()
-                if attempt < MAX_PROXY_TRIES
+                if attempt < MAX_PROXY
                 else None
             )
 
-            driver = None
+            # ─── Try Chrome ──────────────────────────────────────
+            if self._chrome_ok:
+                driver = None
+                try:
+                    driver = self._create_driver(profile, proxy)
+                    driver.get(self.url)
+                    time.sleep(random.uniform(2.5, 4.5))
+                    self._scroll_page(driver)
+                    # Success
+                    self._record_success(device, proxy)
+                    return
+
+                except WebDriverException as exc:
+                    err = str(exc)
+                    is_chrome_broken = any(t in err.lower() for t in (
+                        "cannot find chrome binary",
+                        "chrome failed to start",
+                        "chrome not reachable",
+                        "session not created",
+                        "no such file",
+                        "cannot find",
+                    ))
+                    if is_chrome_broken:
+                        self._chrome_ok = False
+                        self._log("info",
+                                  "Chrome unavailable — switching to HTTP mode")
+                        # Fall through to HTTP below
+                    elif proxy:
+                        self.proxy_manager.remove_proxy(proxy)
+                        self._log("info", "Proxy failed, trying next…")
+                        continue
+                    else:
+                        # Direct also failed
+                        with self._lock:
+                            self.visit_count += 1
+                            self.fail_count += 1
+                        self._log("error", f"Visit failed — {err[:80]}")
+                        return
+
+                except Exception as exc:
+                    self._chrome_ok = False
+                    self._log("info",
+                              f"Chrome error ({str(exc)[:50]}) — using HTTP")
+
+                finally:
+                    if driver:
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+
+            # ─── HTTP fallback ───────────────────────────────────
             try:
-                driver = self._create_driver(profile, proxy=proxy)
-                driver.get(self.url)
-
-                # Wait for page load
-                time.sleep(random.uniform(2.5, 4.5))
-
-                # Scroll for ~10 seconds
-                self._scroll_page(driver)
-
-                # ── Success ──────────────────────────────────────
-                with self._lock:
-                    self.visit_count += 1
-                    self.success_count += 1
-                    self.last_visit = datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
-
-                via = f"proxy {proxy}" if proxy else "direct"
-                self._log(
-                    "success",
-                    f"Visit #{self.visit_count} — {device} ({via})",
-                )
-                return  # done
-
-            except WebDriverException as exc:
-                short = str(exc)[:80]
-                if proxy:
-                    self.proxy_manager.remove_proxy(proxy)
-                    self._log("info", f"Proxy failed ({short}), trying next…")
-                    continue
-                with self._lock:
-                    self.visit_count += 1
-                    self.fail_count += 1
-                self._log("error", f"Visit failed — {short}")
+                self._http_visit(profile["ua"], proxy)
+                self._record_success(device, proxy, mode="HTTP")
                 return
-
             except Exception as exc:
                 if proxy:
                     self.proxy_manager.remove_proxy(proxy)
+                    self._log("info", "Proxy failed (HTTP), trying next…")
                     continue
                 with self._lock:
                     self.visit_count += 1
@@ -400,18 +422,21 @@ class BotEngine:
                 self._log("error", f"Visit failed — {str(exc)[:80]}")
                 return
 
-            finally:
-                if driver:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-
-        # Exhausted all attempts
+        # All attempts exhausted
         with self._lock:
             self.visit_count += 1
             self.fail_count += 1
-        self._log("error", "All proxy attempts failed")
+        self._log("error", "All visit attempts failed")
+
+    def _record_success(self, device, proxy, mode="Browser"):
+        with self._lock:
+            self.visit_count += 1
+            self.success_count += 1
+            self.last_visit = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        via = f"proxy {proxy}" if proxy else "direct"
+        tag = f" [{mode}]" if mode != "Browser" else ""
+        self._log("success",
+                  f"Visit #{self.visit_count} — {device} ({via}){tag}")
 
     # ── Main Loop ────────────────────────────────────────────────
     def _loop(self):
@@ -428,10 +453,8 @@ class BotEngine:
 
             self._visit()
 
-            # Interval with ±60 s jitter (min 60 s)
             jitter = random.randint(-60, 60)
             wait = max(60, self.interval * 60 + jitter)
-
             with self._lock:
                 self.next_visit = (
                     datetime.now() + timedelta(seconds=wait)
@@ -477,13 +500,12 @@ class BotEngine:
             self.status = "running"
             self._log("info", "Bot resumed")
             return {"ok": True, "msg": "Resumed"}
-        else:
-            self._pause.set()
-            self.status = "paused"
-            with self._lock:
-                self.next_visit = None
-            self._log("info", "Bot paused")
-            return {"ok": True, "msg": "Paused"}
+        self._pause.set()
+        self.status = "paused"
+        with self._lock:
+            self.next_visit = None
+        self._log("info", "Bot paused")
+        return {"ok": True, "msg": "Paused"}
 
     def update_settings(self, url=None, interval=None):
         changes = []
@@ -501,7 +523,8 @@ class BotEngine:
             self._log("info", f"Settings updated: {', '.join(changes)}")
         return {
             "ok": True,
-            "msg": f"Updated: {', '.join(changes)}" if changes else "No changes",
+            "msg": (f"Updated: {', '.join(changes)}" if changes
+                    else "No changes"),
         }
 
     def get_status(self):
@@ -517,6 +540,7 @@ class BotEngine:
                 "nextVisit": self.next_visit,
                 "startedAt": self.started_at,
                 "proxyPool": self.proxy_manager.count,
+                "mode": "Browser" if self._chrome_ok else "HTTP",
                 "log": self.log[:50],
             }
 
@@ -526,17 +550,17 @@ bot = BotEngine()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Self-Ping (keeps Render free tier alive)
+#  Self-Ping
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _self_ping():
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-    if not render_url:
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
         return
     while True:
         time.sleep(600)
         try:
-            http_requests.get(f"{render_url}/health", timeout=10)
+            http_requests.get(f"{url}/health", timeout=10)
         except Exception:
             pass
 
@@ -565,7 +589,7 @@ def health():
 def api_login():
     pin = str((request.get_json() or {}).get("pin", ""))
     if pin == BOT_PIN:
-        session.permanent = True  # honour permanent_session_lifetime
+        session.permanent = True
         session["auth"] = True
         return jsonify({"ok": True})
     return jsonify({"ok": False, "msg": "Wrong PIN"}), 401
@@ -617,9 +641,6 @@ def api_settings():
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Entry Point
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"\n  Link Bot running at http://localhost:{port}")
