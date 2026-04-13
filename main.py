@@ -1,14 +1,21 @@
 """
 Link Bot — Cloud-hosted bot with a mobile-friendly dashboard.
 
-Visits a URL silently every N minutes using HTTP requests.
+Uses headless Chrome (Selenium) to realistically browse pages:
+  • Loads the full page (JS, CSS, images)
+  • Scrolls down gradually for ~10 seconds like a real user
+  • Randomises device type, viewport, and User-Agent per visit
+  • Routes each visit through a different free proxy for IP diversity
+
 Control it from your phone via the web dashboard.
 Protected by a PIN code.
 
 Environment Variables (set these on Render):
-    BOT_PIN          — Dashboard PIN (default: 1234)
-    SECRET_KEY       — Flask session secret (change in production)
+    BOT_PIN             — Dashboard PIN (default: 1234)
+    SECRET_KEY          — Flask session secret (change in production)
     RENDER_EXTERNAL_URL — Auto-set by Render, used for self-ping
+    CHROME_BIN          — Path to Chrome/Chromium binary
+    CHROMEDRIVER_PATH   — Path to ChromeDriver binary
 """
 
 import os
@@ -18,6 +25,11 @@ import threading
 import requests as http_requests
 from datetime import datetime, timedelta
 from flask import Flask, render_template, request, jsonify, session
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import WebDriverException
 
 
 # ─── App Setup ───────────────────────────────────────────────────
@@ -33,17 +45,138 @@ DEFAULT_URL = (
     "bid=31001345199&uid=228913354&l=bookDetail"
     "&sc=fxrw_0_bookDetail&rd=4&type=3"
 )
-DEFAULT_INTERVAL = 10  # minutes
+DEFAULT_INTERVAL = 5  # minutes
 
-# Realistic browser User-Agent strings (rotated randomly)
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+# Chrome binary paths (set by Dockerfile / environment)
+CHROME_BIN = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
+CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+
+# ─── Device Profiles (User-Agent + Viewport + Label) ─────────────
+DEVICE_PROFILES = [
+    # Desktop — Chrome / Windows
+    {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+     "vp": (1920, 1080), "device": "Desktop · Win/Chrome"},
+    {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+     "vp": (1366, 768), "device": "Laptop · Win/Chrome"},
+    # Desktop — Firefox / Windows
+    {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
+           "Gecko/20100101 Firefox/125.0",
+     "vp": (1536, 864), "device": "Desktop · Win/Firefox"},
+    # Desktop — Chrome / Mac
+    {"ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+     "vp": (1440, 900), "device": "MacBook · Chrome"},
+    # Desktop — Safari / Mac
+    {"ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
+           "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+     "vp": (1280, 800), "device": "MacBook · Safari"},
+    # Mobile — iPhone
+    {"ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
+           "Mobile/15E148 Safari/604.1",
+     "vp": (390, 844), "device": "iPhone 15"},
+    {"ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) "
+           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 "
+           "Mobile/15E148 Safari/604.1",
+     "vp": (430, 932), "device": "iPhone 15 Pro Max"},
+    # Mobile — Android
+    {"ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+     "vp": (412, 915), "device": "Pixel 8 Pro"},
+    {"ua": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+     "vp": (384, 854), "device": "Galaxy S24 Ultra"},
+    {"ua": "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+     "vp": (360, 800), "device": "Galaxy A54"},
+    # Tablet — iPad
+    {"ua": "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) "
+           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
+           "Mobile/15E148 Safari/604.1",
+     "vp": (820, 1180), "device": "iPad Air"},
+    # Desktop — Linux
+    {"ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+     "vp": (1920, 1080), "device": "Desktop · Linux/Chrome"},
 ]
+
+# ─── Free Proxy Sources ─────────────────────────────────────────
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies"
+    "&protocol=http&timeout=5000&country=all&ssl=all&anonymity=elite",
+    "https://api.proxyscrape.com/v2/?request=displayproxies"
+    "&protocol=http&timeout=5000&country=all&ssl=all&anonymity=anonymous",
+    "https://www.proxy-list.download/api/v1/get?type=https",
+]
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  Proxy Manager
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class ProxyManager:
+    """Fetches and rotates free HTTP/HTTPS proxies."""
+
+    REFRESH_INTERVAL = 30 * 60  # 30 minutes
+
+    def __init__(self):
+        self.proxies: list[str] = []
+        self.last_refresh: datetime | None = None
+        self._lock = threading.Lock()
+        self._log_fn = None
+
+    def set_logger(self, fn):
+        self._log_fn = fn
+
+    def _log(self, level, msg):
+        if self._log_fn:
+            self._log_fn(level, msg)
+
+    # ── Fetch proxies from public APIs ───────────────────────────
+    def refresh(self):
+        new_proxies: list[str] = []
+        for source in PROXY_SOURCES:
+            try:
+                resp = http_requests.get(source, timeout=10)
+                if resp.status_code == 200:
+                    for line in resp.text.strip().splitlines():
+                        p = line.strip()
+                        if p and ":" in p:
+                            new_proxies.append(p)
+            except Exception:
+                continue
+
+        with self._lock:
+            self.proxies = list(set(new_proxies))
+            random.shuffle(self.proxies)
+            self.last_refresh = datetime.now()
+
+        self._log("info", f"Proxy pool refreshed — {len(self.proxies)} proxies")
+
+    # ── Pick a random proxy ──────────────────────────────────────
+    def get_proxy(self) -> str | None:
+        with self._lock:
+            return random.choice(self.proxies) if self.proxies else None
+
+    def remove_proxy(self, proxy: str):
+        with self._lock:
+            try:
+                self.proxies.remove(proxy)
+            except ValueError:
+                pass
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self.proxies)
+
+    def needs_refresh(self) -> bool:
+        if not self.last_refresh:
+            return True
+        elapsed = (datetime.now() - self.last_refresh).total_seconds()
+        return elapsed > self.REFRESH_INTERVAL
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -51,7 +184,7 @@ USER_AGENTS = [
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class BotEngine:
-    """Background worker that visits a URL at a configurable interval."""
+    """Background worker that visits a URL with a real headless browser."""
 
     def __init__(self):
         self.url = DEFAULT_URL
@@ -63,11 +196,13 @@ class BotEngine:
         self.last_visit = None
         self.next_visit = None
         self.started_at = None
-        self.log = []
+        self.log: list[dict] = []
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._thread = None
         self._lock = threading.Lock()
+        self.proxy_manager = ProxyManager()
+        self.proxy_manager.set_logger(self._log)
 
     # ── Logging ──────────────────────────────────────────────────
     def _log(self, level, msg):
@@ -81,54 +216,180 @@ class BotEngine:
             if len(self.log) > 200:
                 self.log = self.log[:200]
 
-    # ── Visit logic ──────────────────────────────────────────────
-    def _visit(self):
-        try:
-            headers = {
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Cache-Control": "max-age=0",
-            }
-            resp = http_requests.get(
-                self.url, headers=headers, timeout=30, allow_redirects=True
-            )
-            with self._lock:
-                self.visit_count += 1
-                self.success_count += 1
-                self.last_visit = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self._log("success", f"Visit #{self.visit_count} — HTTP {resp.status_code}")
-        except http_requests.RequestException as e:
-            with self._lock:
-                self.visit_count += 1
-                self.fail_count += 1
-            self._log("error", f"Visit failed — {str(e)[:80]}")
+    # ── Chrome Driver Factory ────────────────────────────────────
+    @staticmethod
+    def _create_driver(profile: dict, proxy: str | None = None):
+        """Launch a headless Chrome with the given fingerprint."""
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-infobars")
+        opts.add_argument("--disable-notifications")
+        opts.add_argument("--disable-popup-blocking")
 
-    # ── Main loop ────────────────────────────────────────────────
+        # Memory optimizations (Render free-tier = 512 MB)
+        opts.add_argument("--single-process")
+        opts.add_argument("--disable-background-timer-throttling")
+        opts.add_argument("--disable-renderer-backgrounding")
+        opts.add_argument("--disable-backgrounding-occluded-windows")
+        opts.add_argument("--js-flags=--max-old-space-size=128")
+
+        # Random fingerprint
+        opts.add_argument(f"--user-agent={profile['ua']}")
+        w, h = profile["vp"]
+        opts.add_argument(f"--window-size={w},{h}")
+
+        # Proxy
+        if proxy:
+            opts.add_argument(f"--proxy-server=http://{proxy}")
+
+        # Chrome binary
+        if os.path.exists(CHROME_BIN):
+            opts.binary_location = CHROME_BIN
+
+        svc = Service(CHROMEDRIVER_PATH)
+        driver = webdriver.Chrome(service=svc, options=opts)
+        driver.set_page_load_timeout(30)
+        return driver
+
+    # ── Realistic Scroll Behaviour ───────────────────────────────
+    @staticmethod
+    def _scroll_page(driver, duration_target: float = 10.0):
+        """Scroll down the page gradually over ~duration_target seconds."""
+        try:
+            total_h = driver.execute_script(
+                "return Math.max("
+                "  document.body.scrollHeight,"
+                "  document.documentElement.scrollHeight"
+                ")"
+            )
+        except Exception:
+            total_h = 4000
+
+        steps = random.randint(5, 8)
+        per_step = duration_target / steps
+
+        for i in range(1, steps + 1):
+            target_y = int(total_h * i / steps)
+            driver.execute_script(
+                f"window.scrollTo({{top:{target_y},behavior:'smooth'}})"
+            )
+            time.sleep(per_step + random.uniform(-0.3, 0.5))
+
+        # Pause at bottom (like reading)
+        time.sleep(random.uniform(1.0, 3.0))
+
+    # ── Single Visit ─────────────────────────────────────────────
+    def _visit(self):
+        profile = random.choice(DEVICE_PROFILES)
+        device = profile["device"]
+
+        # Refresh proxy pool when stale
+        if self.proxy_manager.needs_refresh():
+            try:
+                self.proxy_manager.refresh()
+            except Exception:
+                self._log("info", "Proxy refresh failed — will use direct")
+
+        # Try up to 3 proxies, then fall back to direct connection
+        MAX_PROXY_TRIES = 3
+        for attempt in range(MAX_PROXY_TRIES + 1):
+            proxy = (
+                self.proxy_manager.get_proxy()
+                if attempt < MAX_PROXY_TRIES
+                else None
+            )
+
+            driver = None
+            try:
+                driver = self._create_driver(profile, proxy=proxy)
+                driver.get(self.url)
+
+                # Wait for page load
+                time.sleep(random.uniform(2.5, 4.5))
+
+                # Scroll for ~10 seconds
+                self._scroll_page(driver)
+
+                # ── Success ──────────────────────────────────────
+                with self._lock:
+                    self.visit_count += 1
+                    self.success_count += 1
+                    self.last_visit = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+
+                via = f"proxy {proxy}" if proxy else "direct"
+                self._log(
+                    "success",
+                    f"Visit #{self.visit_count} — {device} ({via})",
+                )
+                return  # done
+
+            except WebDriverException as exc:
+                short = str(exc)[:80]
+                if proxy:
+                    self.proxy_manager.remove_proxy(proxy)
+                    self._log("info", f"Proxy failed ({short}), trying next…")
+                    continue
+                # Direct also failed
+                with self._lock:
+                    self.visit_count += 1
+                    self.fail_count += 1
+                self._log("error", f"Visit failed — {short}")
+                return
+
+            except Exception as exc:
+                if proxy:
+                    self.proxy_manager.remove_proxy(proxy)
+                    continue
+                with self._lock:
+                    self.visit_count += 1
+                    self.fail_count += 1
+                self._log("error", f"Visit failed — {str(exc)[:80]}")
+                return
+
+            finally:
+                if driver:
+                    try:
+                        driver.quit()
+                    except Exception:
+                        pass
+
+        # Exhausted all attempts
+        with self._lock:
+            self.visit_count += 1
+            self.fail_count += 1
+        self._log("error", "All proxy attempts failed")
+
+    # ── Main Loop ────────────────────────────────────────────────
     def _loop(self):
-        self._log("info", "Bot started")
+        self._log("info", "Bot started — fetching proxies…")
+        try:
+            self.proxy_manager.refresh()
+        except Exception:
+            self._log("info", "Initial proxy fetch failed — will retry")
+
         while not self._stop.is_set():
-            # If paused, spin-wait
             if self._pause.is_set():
                 time.sleep(1)
                 continue
 
             self._visit()
 
+            # Interval with ±60 s jitter (min 60 s)
+            jitter = random.randint(-60, 60)
+            wait = max(60, self.interval * 60 + jitter)
+
             with self._lock:
                 self.next_visit = (
-                    datetime.now() + timedelta(minutes=self.interval)
+                    datetime.now() + timedelta(seconds=wait)
                 ).strftime("%Y-%m-%d %H:%M:%S")
 
-            # Sleep in 1s chunks for responsiveness
-            for _ in range(self.interval * 60):
+            for _ in range(wait):
                 if self._stop.is_set() or self._pause.is_set():
                     break
                 time.sleep(1)
@@ -190,7 +451,10 @@ class BotEngine:
                 pass
         if changes:
             self._log("info", f"Settings updated: {', '.join(changes)}")
-        return {"ok": True, "msg": f"Updated: {', '.join(changes)}" if changes else "No changes"}
+        return {
+            "ok": True,
+            "msg": f"Updated: {', '.join(changes)}" if changes else "No changes",
+        }
 
     def get_status(self):
         with self._lock:
@@ -204,6 +468,7 @@ class BotEngine:
                 "lastVisit": self.last_visit,
                 "nextVisit": self.next_visit,
                 "startedAt": self.started_at,
+                "proxyPool": self.proxy_manager.count,
                 "log": self.log[:50],
             }
 
@@ -231,7 +496,7 @@ threading.Thread(target=_self_ping, daemon=True).start()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Routes
+#  Routes  (unchanged from previous version)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _authed():
