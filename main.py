@@ -14,13 +14,12 @@ Environment Variables (set these on Render):
     BOT_PIN             — Dashboard PIN (default: 1234)
     SECRET_KEY          — Flask session secret (change in production)
     RENDER_EXTERNAL_URL — Auto-set by Render, used for self-ping
-    CHROME_BIN          — Path to Chrome/Chromium binary
-    CHROMEDRIVER_PATH   — Path to ChromeDriver binary
 """
 
 import os
 import time
 import random
+import shutil
 import threading
 import requests as http_requests
 from datetime import datetime, timedelta
@@ -30,6 +29,8 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import WebDriverException
+
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 # ─── App Setup ───────────────────────────────────────────────────
@@ -47,9 +48,40 @@ DEFAULT_URL = (
 )
 DEFAULT_INTERVAL = 5  # minutes
 
-# Chrome binary paths (set by Dockerfile / environment)
-CHROME_BIN = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
-CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "/usr/bin/chromedriver")
+
+# ─── Auto-detect Chrome + ChromeDriver ──────────────────────────
+
+def _find_chrome_binary():
+    """Find the installed Chrome/Chromium binary."""
+    for name in [
+        "google-chrome", "google-chrome-stable",
+        "chromium", "chromium-browser",
+    ]:
+        path = shutil.which(name)
+        if path:
+            return path
+    # Check common hardcoded paths
+    for path in [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _get_chromedriver_service():
+    """Get a Selenium Service for ChromeDriver (auto-managed)."""
+    # webdriver-manager will find the cached driver or download it
+    driver_path = ChromeDriverManager().install()
+    return Service(driver_path)
+
+
+CHROME_BINARY = _find_chrome_binary()
+print(f"  [Boot] Chrome binary: {CHROME_BINARY or 'NOT FOUND'}")
+
 
 # ─── Device Profiles (User-Agent + Viewport + Label) ─────────────
 DEVICE_PROFILES = [
@@ -134,7 +166,6 @@ class ProxyManager:
         if self._log_fn:
             self._log_fn(level, msg)
 
-    # ── Fetch proxies from public APIs ───────────────────────────
     def refresh(self):
         new_proxies: list[str] = []
         for source in PROXY_SOURCES:
@@ -155,7 +186,6 @@ class ProxyManager:
 
         self._log("info", f"Proxy pool refreshed — {len(self.proxies)} proxies")
 
-    # ── Pick a random proxy ──────────────────────────────────────
     def get_proxy(self) -> str | None:
         with self._lock:
             return random.choice(self.proxies) if self.proxies else None
@@ -175,8 +205,7 @@ class ProxyManager:
     def needs_refresh(self) -> bool:
         if not self.last_refresh:
             return True
-        elapsed = (datetime.now() - self.last_refresh).total_seconds()
-        return elapsed > self.REFRESH_INTERVAL
+        return (datetime.now() - self.last_refresh).total_seconds() > self.REFRESH_INTERVAL
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -246,11 +275,12 @@ class BotEngine:
         if proxy:
             opts.add_argument(f"--proxy-server=http://{proxy}")
 
-        # Chrome binary
-        if os.path.exists(CHROME_BIN):
-            opts.binary_location = CHROME_BIN
+        # Chrome binary (auto-detected at boot)
+        if CHROME_BINARY:
+            opts.binary_location = CHROME_BINARY
 
-        svc = Service(CHROMEDRIVER_PATH)
+        # ChromeDriver (managed by webdriver-manager)
+        svc = _get_chromedriver_service()
         driver = webdriver.Chrome(service=svc, options=opts)
         driver.set_page_load_timeout(30)
         return driver
@@ -335,7 +365,6 @@ class BotEngine:
                     self.proxy_manager.remove_proxy(proxy)
                     self._log("info", f"Proxy failed ({short}), trying next…")
                     continue
-                # Direct also failed
                 with self._lock:
                     self.visit_count += 1
                     self.fail_count += 1
@@ -484,7 +513,7 @@ bot = BotEngine()
 def _self_ping():
     render_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not render_url:
-        return  # Not deployed on Render — skip
+        return
     while True:
         time.sleep(600)
         try:
@@ -496,7 +525,7 @@ threading.Thread(target=_self_ping, daemon=True).start()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Routes  (unchanged from previous version)
+#  Routes  (unchanged)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _authed():

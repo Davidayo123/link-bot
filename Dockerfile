@@ -1,9 +1,10 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
-# ── Install Chromium + ChromeDriver + system fonts ──────────────
+# ── 1. System deps for headless Chrome ──────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        chromium \
-        chromium-driver \
+        wget \
+        gnupg2 \
+        ca-certificates \
         fonts-liberation \
         libnss3 \
         libxss1 \
@@ -19,20 +20,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxcomposite1 \
         libxdamage1 \
         libxrandr2 \
-        xdg-utils \
+        xdg-utils
+
+# ── 2. Install Google Chrome Stable (most reliable for Selenium) ─
+RUN wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+      | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] \
+       http://dl.google.com/linux/chrome/deb/ stable main" \
+       > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Environment ─────────────────────────────────────────────────
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+# ── 3. Verify Chrome is installed ───────────────────────────────
+RUN google-chrome --version
 
 WORKDIR /app
 
-# ── Python deps (cached layer) ──────────────────────────────────
+# ── 4. Python dependencies (cached layer) ──────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Application code ────────────────────────────────────────────
+# ── 5. Pre-cache matching ChromeDriver via webdriver-manager ────
+#    This downloads the correct chromedriver during build so
+#    we don't need internet access at runtime.
+RUN python -c "\
+from webdriver_manager.chrome import ChromeDriverManager; \
+path = ChromeDriverManager().install(); \
+print(f'ChromeDriver cached at: {path}')"
+
+# ── 6. Application code ────────────────────────────────────────
 COPY . .
 
 EXPOSE 10000
