@@ -30,14 +30,15 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import WebDriverException
 
-from webdriver_manager.chrome import ChromeDriverManager
-
 
 # ─── App Setup ───────────────────────────────────────────────────
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "bot-secret-change-in-production-xyz")
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# Sessions expire after 30 minutes → user must re-enter PIN
+app.permanent_session_lifetime = timedelta(minutes=30)
 
 # ─── Configuration ───────────────────────────────────────────────
 BOT_PIN = os.environ.get("BOT_PIN", "1234")
@@ -52,59 +53,80 @@ DEFAULT_INTERVAL = 5  # minutes
 # ─── Auto-detect Chrome + ChromeDriver ──────────────────────────
 
 def _find_chrome_binary():
-    """Find the installed Chrome/Chromium binary."""
-    for name in [
-        "google-chrome", "google-chrome-stable",
-        "chromium", "chromium-browser",
-    ]:
-        path = shutil.which(name)
-        if path:
-            return path
-    # Check common hardcoded paths
-    for path in [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
+    """Search PATH and common locations for a Chrome/Chromium binary."""
+    # 1) Check $PATH
+    for name in ("chromium", "chromium-browser",
+                 "google-chrome", "google-chrome-stable"):
+        p = shutil.which(name)
+        if p:
+            return p
+    # 2) Common absolute paths
+    for p in (
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
-    ]:
-        if os.path.isfile(path):
-            return path
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/lib/chromium/chromium",
+    ):
+        if os.path.isfile(p):
+            return p
     return None
 
 
-def _get_chromedriver_service():
-    """Get a Selenium Service for ChromeDriver (auto-managed)."""
-    # webdriver-manager will find the cached driver or download it
-    driver_path = ChromeDriverManager().install()
-    return Service(driver_path)
+def _find_chromedriver():
+    """Search PATH and common locations for the ChromeDriver binary."""
+    p = shutil.which("chromedriver")
+    if p:
+        return p
+    for p in (
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ):
+        if os.path.isfile(p):
+            return p
+    return None
 
 
+# Resolve once at import time and log the results
 CHROME_BINARY = _find_chrome_binary()
-print(f"  [Boot] Chrome binary: {CHROME_BINARY or 'NOT FOUND'}")
+CHROMEDRIVER_PATH = _find_chromedriver()
+print(f"  [Boot] Chrome binary  : {CHROME_BINARY or 'NOT FOUND'}")
+print(f"  [Boot] ChromeDriver   : {CHROMEDRIVER_PATH or 'NOT FOUND (will try webdriver-manager)'}")
+
+
+def _get_chromedriver_service():
+    """Return a Selenium Service pointing to ChromeDriver."""
+    if CHROMEDRIVER_PATH:
+        return Service(CHROMEDRIVER_PATH)
+    # Fallback — let webdriver-manager download a matching driver
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        return Service(ChromeDriverManager().install())
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot locate ChromeDriver. System path not found and "
+            f"webdriver-manager also failed: {exc}"
+        )
 
 
 # ─── Device Profiles (User-Agent + Viewport + Label) ─────────────
 DEVICE_PROFILES = [
-    # Desktop — Chrome / Windows
     {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
      "vp": (1920, 1080), "device": "Desktop · Win/Chrome"},
     {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
      "vp": (1366, 768), "device": "Laptop · Win/Chrome"},
-    # Desktop — Firefox / Windows
     {"ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
            "Gecko/20100101 Firefox/125.0",
      "vp": (1536, 864), "device": "Desktop · Win/Firefox"},
-    # Desktop — Chrome / Mac
     {"ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
      "vp": (1440, 900), "device": "MacBook · Chrome"},
-    # Desktop — Safari / Mac
     {"ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 "
            "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
      "vp": (1280, 800), "device": "MacBook · Safari"},
-    # Mobile — iPhone
     {"ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
            "Mobile/15E148 Safari/604.1",
@@ -113,7 +135,6 @@ DEVICE_PROFILES = [
            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 "
            "Mobile/15E148 Safari/604.1",
      "vp": (430, 932), "device": "iPhone 15 Pro Max"},
-    # Mobile — Android
     {"ua": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
      "vp": (412, 915), "device": "Pixel 8 Pro"},
@@ -123,12 +144,10 @@ DEVICE_PROFILES = [
     {"ua": "Mozilla/5.0 (Linux; Android 13; SM-A546B) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
      "vp": (360, 800), "device": "Galaxy A54"},
-    # Tablet — iPad
     {"ua": "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) "
            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
            "Mobile/15E148 Safari/604.1",
      "vp": (820, 1180), "device": "iPad Air"},
-    # Desktop — Linux
     {"ua": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
      "vp": (1920, 1080), "device": "Desktop · Linux/Chrome"},
@@ -279,7 +298,7 @@ class BotEngine:
         if CHROME_BINARY:
             opts.binary_location = CHROME_BINARY
 
-        # ChromeDriver (managed by webdriver-manager)
+        # ChromeDriver (system → webdriver-manager fallback)
         svc = _get_chromedriver_service()
         driver = webdriver.Chrome(service=svc, options=opts)
         driver.set_page_load_timeout(30)
@@ -525,7 +544,7 @@ threading.Thread(target=_self_ping, daemon=True).start()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  Routes  (unchanged)
+#  Routes
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _authed():
@@ -546,6 +565,7 @@ def health():
 def api_login():
     pin = str((request.get_json() or {}).get("pin", ""))
     if pin == BOT_PIN:
+        session.permanent = True  # honour permanent_session_lifetime
         session["auth"] = True
         return jsonify({"ok": True})
     return jsonify({"ok": False, "msg": "Wrong PIN"}), 401
@@ -553,7 +573,7 @@ def api_login():
 
 @app.route("/api/logout", methods=["POST"])
 def api_logout():
-    session.pop("auth", None)
+    session.clear()
     return jsonify({"ok": True})
 
 
